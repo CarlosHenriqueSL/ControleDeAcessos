@@ -1,6 +1,6 @@
 /*
  *  Por: Carlos Henrique Silva Lopes
- *  Data: 21-05-2025
+ *  Data: 26-05-2025
  *
  *  Controle de acessos usando semaforos e mutexes com o FreeRTOS
  *
@@ -16,15 +16,14 @@
 #include "hardware/i2c.h"
 #include "hardware/pio.h"
 #include "hardware/pwm.h"
-#include "hardware/uart.h"
 #include "hardware/clocks.h"
 #include "FreeRTOS.h"
 #include "FreeRTOSConfig.h"
 #include "task.h"
 #include "semphr.h"
 #include "blink.pio.h"
-#include "lib/ssd1306.h"
-#include "lib/numeros.h"
+#include "lib/ssd1306.h" // Arquivo para desenhar no Display OLED
+#include "lib/numeros.h" // Arquivo para desenhar na matriz de LEDs
 
 // Definicao dos pinos
 #define WS2812_PIN 7
@@ -88,11 +87,11 @@ void vTaskReset()
 }
 
 /*
- * Tarefa para o botao A (gpio 5). Adiciona um usuario no sistema e mostra "usuario adicionado!" no
- * display. A escrita no display eh protegida pelo mutex. Utiliza o semaforo contador para registrar a
- * interrupcao. Como o semaforo eh compartilhado com a tarefa de saida (botao B), ele verifica se
- * realmente foi o botao A o ultimo pressionado (Give() feito pelo botao A), e se o numero de usuarios eh
- * menor que 10. Se sim, prossegue com a remocao do usuario. Senao, devolve o semaforo.
+ * Tarefa para o botao B (gpio 6). Retira um usuario do sistema e mostra "-1 usuario!" no display.
+ * A escrita no display eh protegida pelo mutex. Utiliza o semaforo contador para registrar a interrupcao.
+ * Como o semaforo eh compartilhado com a tarefa de entrada (botao A), ele verifica se realmente foi o
+ * botao B o ultimo pressionado (Give() feito pelo botao B).
+ * Se sim, prossegue com a remocao do usuario. Senao, devolve o semaforo.
  */
 void vTaskSaida()
 {
@@ -101,13 +100,13 @@ void vTaskSaida()
         // Verifica semaforo contador liberado
         if (xSemaphoreTake(xCounterSem, portMAX_DELAY) == pdTRUE)
         {
-            /* Verifica se realmente foi o botao B quem liberou o semaforo. E se ha usuarios que podem ser
-               removidos (numero de usuarios diferente de 0) */
-            if (ultimoBotaoPressionado == BUTTON_B && numeroDeUsuarios != 0)
+            // Verifica se realmente foi o botao B quem liberou o semaforo.
+            if (ultimoBotaoPressionado == BUTTON_B)
             {
                 // Verifica mutex liberado para escrita no display
                 if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE)
                 {
+                    ssd1306_draw_string(&ssd, "              ", 5, 5);
                     ssd1306_draw_string(&ssd, "-1 usuario!", 5, 5);
                     ssd1306_send_data(&ssd);
                     xSemaphoreGive(xMutex);
@@ -115,7 +114,6 @@ void vTaskSaida()
                 vTaskDelay(pdMS_TO_TICKS(1250));
                 numeroDeUsuarios--;
                 botaoPressionado = false;
-                printf("%d", numeroDeUsuarios);
             }
             else
             {
@@ -127,11 +125,11 @@ void vTaskSaida()
 }
 
 /*
- * Tarefa para o botao B (gpio 6). Retira um usuario do sistema e mostra "-1 usuario!" no display.
- * A escrita no display eh protegida pelo mutex. Utiliza o semaforo contador para registrar a interrupcao.
- * Como o semaforo eh compartilhado com a tarefa de entrada (botao A), ele verifica se realmente foi o
- * botao B o ultimo pressionado (Give() feito pelo botao B), e se o numero de usuarios eh maior que 0.
- * Se sim, prossegue com a remocao do usuario. Senao, devolve o semaforo.
+ * Tarefa para o botao A (gpio 5). Adiciona um usuario no sistema e mostra "usuario adicionado!" no
+ * display. A escrita no display eh protegida pelo mutex. Utiliza o semaforo contador para registrar a
+ * interrupcao. Como o semaforo eh compartilhado com a tarefa de saida (botao B), ele verifica se
+ * realmente foi o botao A o ultimo pressionado (Give() feito pelo botao A), e se o numero de usuarios eh
+ * menor que 10. Se sim, prossegue com a remocao do usuario. Senao, devolve o semaforo.
  */
 void vTaskEntrada()
 {
@@ -154,7 +152,6 @@ void vTaskEntrada()
                 vTaskDelay(pdMS_TO_TICKS(1250));
                 numeroDeUsuarios++;
                 botaoPressionado = false;
-                printf("%d", numeroDeUsuarios);
             }
             else
             {
@@ -237,73 +234,6 @@ void vTaskBuzzer()
     }
 }
 
-uint32_t matrix_rgb(double r, double g, double b)
-{
-    unsigned char R = r * 255;
-    unsigned char G = g * 255;
-    unsigned char B = b * 255;
-    return (G << 24) | (R << 16) | (B << 8);
-}
-
-// Envia padrão para LEDs WS2812
-void desenho_pio(double *desenho, PIO pio, uint sm, float r, float g, float b)
-{
-    for (int i = 0; i < NUM_PIXELS; i++)
-    {
-        pio_sm_put_blocking(pio, sm, matrix_rgb(desenho[24 - i] * r, desenho[24 - i] * g, desenho[24 - i] * b));
-    }
-}
-
-/*
- * Tarefa para a matriz de LEDs. Exibe um padrao de reinicio caso o botao do joystick (gpio 22) seja
- * pressionado. Tambem emite um alerta caso o sistema esteja com 9 ou 10 usuarios.
- */
-void vTaskMatriz()
-{
-    PIO pio = pio0;
-    uint offset = pio_add_program(pio, &blink_program);
-    uint sm = pio_claim_unused_sm(pio, true);
-    blink_program_init(pio, sm, offset, WS2812_PIN);
-
-    // Vetor para numero de usuarios == 9 ou numero de usuarios == 10
-    double *feedback[3] = {alerta, erro, matrizDesligada};
-
-    // Vetor para fazer a animacao de reinicio do sistema. Todos eles estao desenhados em lib/numeros.c
-    double *animacaoReinicio[15] = {reinicio1, reinicio2, reinicio3, reinicio4, reinicio5, reinicio6,
-                                    reinicio7, reinicio8, reinicio9, reinicio10, reinicio11, reinicio12,
-                                    reinicio13, reinicio14, matrizDesligada};
-
-    while (true)
-    {
-        // Animacao de reinicio, botao do joystick pressionado
-        if (ultimoBotaoPressionado == BUTTON_JOY && botaoPressionado)
-        {
-            for (int i = 0; i < 15; i++)
-            {
-                desenho_pio(animacaoReinicio[i], pio, sm, 0.0, 1.0, 0.0);
-                vTaskDelay(pdMS_TO_TICKS(84));
-            }
-        }
-        else if (ultimoBotaoPressionado == BUTTON_A && botaoPressionado)
-        {
-            if (numeroDeUsuarios == 8)
-            {
-                desenho_pio(feedback[0], pio, sm, 1.0, 1.0, 0.0);
-                vTaskDelay(pdMS_TO_TICKS(625));
-                desenho_pio(feedback[1], pio, sm, 1.0, 1.0, 0.0);
-                vTaskDelay(pdMS_TO_TICKS(625));
-            }
-            else if (numeroDeUsuarios == 10)
-            {
-                desenho_pio(feedback[2], pio, sm, 1.0, 0.0, 0.0);
-                vTaskDelay(pdMS_TO_TICKS(400));
-            }
-        }
-        desenho_pio(feedback[3], pio, sm, 0.0, 0.0, 0.0);
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
 /*
  * Tarefa para alternar entre os LEDs RGB com PWM. Varia junto com o numero de usuarios. Ate 8 usuarios
  * o LED azul esta aceso. Com 8 usuarios, e LED azul apaga e o LED verde acende. Com 9, exibe a cor amarela.
@@ -342,6 +272,76 @@ void vTaskRGB()
             pwm_set_gpio_level(LED_PIN_RED, 255);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// Funcao para definir as cores da matriz de LEDs
+uint32_t matrix_rgb(double r, double g, double b)
+{
+    unsigned char R = r * 255;
+    unsigned char G = g * 255;
+    unsigned char B = b * 255;
+    return (G << 24) | (R << 16) | (B << 8);
+}
+
+// Funcao para desenhar na matriz de LEDs
+void desenho_pio(double *desenho, PIO pio, uint sm, float r, float g, float b)
+{
+    for (int i = 0; i < NUM_PIXELS; i++)
+    {
+        pio_sm_put_blocking(pio, sm, matrix_rgb(desenho[24 - i] * r, desenho[24 - i] * g, desenho[24 - i] * b));
+    }
+}
+
+/*
+ * Tarefa para a matriz de LEDs. Exibe um padrao de reinicio caso o botao do joystick (gpio 22) seja
+ * pressionado. Tambem emite um alerta caso o sistema esteja com 9 ou 10 usuarios.
+ */
+void vTaskMatriz()
+{
+    PIO pio = pio0;
+    uint offset = pio_add_program(pio, &blink_program);
+    uint sm = pio_claim_unused_sm(pio, true);
+    blink_program_init(pio, sm, offset, WS2812_PIN);
+
+    // Vetor para numero de usuarios == 9 ou numero de usuarios == 10
+    double *feedback[3] = {alerta, erro, matrizDesligada};
+
+    // Vetor para fazer a animacao de reinicio do sistema. Todos eles estao desenhados em lib/numeros.c
+    double *animacaoReinicio[15] = {reinicio1, reinicio2, reinicio3, reinicio4, reinicio5, reinicio6,
+                                    reinicio7, reinicio8, reinicio9, reinicio10, reinicio11, reinicio12,
+                                    reinicio13, reinicio14, matrizDesligada};
+
+    while (true)
+    {
+        // Animacao de reinicio, botao do joystick pressionado
+        if (ultimoBotaoPressionado == BUTTON_JOY && botaoPressionado)
+        {
+            for (int i = 0; i < 15; i++)
+            {
+                desenho_pio(animacaoReinicio[i], pio, sm, 0.0, 1.0, 0.0);
+                vTaskDelay(pdMS_TO_TICKS(84));
+            }
+        }
+        // Alerta para insercao acima de 8 ou delecao acima de 10
+        else if (ultimoBotaoPressionado == BUTTON_A && botaoPressionado)
+        {
+            // Verifica se o botao A foi pressionado com 8 usuarios
+            if (numeroDeUsuarios == 8 && ultimoBotaoPressionado == BUTTON_A)
+            {
+                desenho_pio(feedback[0], pio, sm, 1.0, 1.0, 0.0);
+                vTaskDelay(pdMS_TO_TICKS(1250));
+            }
+            // Verifica se o sistema esta cheio
+            else if (numeroDeUsuarios == 10)
+            {
+                desenho_pio(feedback[1], pio, sm, 1.0, 0.0, 0.0);
+                vTaskDelay(pdMS_TO_TICKS(625));
+                botaoPressionado = false;
+            }
+        }
+        desenho_pio(feedback[2], pio, sm, 0.0, 0.0, 0.0);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -484,6 +484,10 @@ void gpio_irq_handler(uint gpio, uint32_t events)
     }
     else if (gpio == BUTTON_B)
     {
+        if (numeroDeUsuarios == 0)
+        {
+            return;
+        }
         botaoPressionado = true;
         ultimoBotaoPressionado = BUTTON_B;
         gpio_callback(gpio, events);
