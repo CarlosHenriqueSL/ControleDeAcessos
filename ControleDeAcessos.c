@@ -2,14 +2,13 @@
  *  Por: Carlos Henrique Silva Lopes
  *  Data: 21-05-2025
  *
- *  Exemplo de uso de semaforos com FreeRTOS
+ *  Controle de acessos usando semaforos e mutexes com o FreeRTOS
  *
- *  Descrição: Simulação de um semáforo com um botão.
- *  O botão A aciona o semáforo e o botão B reinicia o programa.
- *  O semáforo é representado por um display OLED SSD1306.
- *  O botão A é conectado ao pino 5. Quando pressionado, o semáforo muda de estado.
- *  Escreve no display "Aguardando evento..." e, quando o botão A é pressionado,
- *  muda para "Botão Pressionado!" por 4 segundos.
+ *  Descrição: Controle de acessos simultaneos.
+ *  O botão A incrementa o numero de usuarios e o botao B decrementa. O joystick reinicia a contagem.
+ *  O numero de usuarios eh exibido no Display OLED SSD1306.
+ *  O sistema conta com buzzer para acessibilidade para pessoas cegas
+ *  A matriz de LEDs exibe padrao para alerta quanto ao numero de usuarios.
  */
 
 #include <stdio.h>
@@ -52,24 +51,27 @@ SemaphoreHandle_t xCounterSem;
 
 ssd1306_t ssd;
 
-static uint32_t last_irq_time_joy = 0;
+static uint32_t lastIrqTime = 0; // Registra o tempo da ultima interrupcao
 
-// Flag para alternar o modo. True = modo normal, false = modo noturno.
-volatile bool modoNormalOn = true;
-volatile bool limiteAtingido = false;
-volatile bool botaoPressionado = false;
-volatile uint8_t numeroDeUsuarios = 0;
-volatile uint8_t ultimoBotaoPressionado = 0;
+volatile bool limiteAtingido = false;        // Verifica se o limite de 10 usuarios foi atingido
+volatile bool botaoPressionado = false;      // True: se um botao foi pressionado nos ultimos 1.25s. Senao, false
+volatile uint8_t numeroDeUsuarios = 0;       // Registra o numero de usuarios no sistema
+volatile uint8_t ultimoBotaoPressionado = 0; // Detecta o ultimo botao pressionado, A, B ou Joystick
 
+/*
+ * Tarefa para o botao do joystick (gpio 22). Reinicia o numero de usuarios a 0 e mostra no display a
+ * quantidade de foi retirada. A escrita no display, bem como para os outros botoes, eh protegida pelo
+ * mutex. Utiliza um semaforo binario para registrar a interrupcao.
+ */
 void vTaskReset()
 {
     static char buffer[13];
     while (true)
     {
-        // Tarefa está bloqueada até que o semáforo seja liberado
-        // O semáforo é liberado na ISR do botão
+        // Verifica semaforo binario liberado
         if (xSemaphoreTake(xBinarySem, portMAX_DELAY) == pdTRUE)
         {
+            // Verifica mutex liberado para escrita no display
             if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE)
             {
                 sprintf(buffer, "-%d usuario(s)!", numeroDeUsuarios);
@@ -85,14 +87,25 @@ void vTaskReset()
     }
 }
 
+/*
+ * Tarefa para o botao A (gpio 5). Adiciona um usuario no sistema e mostra "usuario adicionado!" no
+ * display. A escrita no display eh protegida pelo mutex. Utiliza o semaforo contador para registrar a
+ * interrupcao. Como o semaforo eh compartilhado com a tarefa de saida (botao B), ele verifica se
+ * realmente foi o botao A o ultimo pressionado (Give() feito pelo botao A), e se o numero de usuarios eh
+ * menor que 10. Se sim, prossegue com a remocao do usuario. Senao, devolve o semaforo.
+ */
 void vTaskSaida()
 {
     while (true)
     {
+        // Verifica semaforo contador liberado
         if (xSemaphoreTake(xCounterSem, portMAX_DELAY) == pdTRUE)
         {
+            /* Verifica se realmente foi o botao B quem liberou o semaforo. E se ha usuarios que podem ser
+               removidos (numero de usuarios diferente de 0) */
             if (ultimoBotaoPressionado == BUTTON_B && numeroDeUsuarios != 0)
             {
+                // Verifica mutex liberado para escrita no display
                 if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE)
                 {
                     ssd1306_draw_string(&ssd, "-1 usuario!", 5, 5);
@@ -113,14 +126,25 @@ void vTaskSaida()
     }
 }
 
+/*
+ * Tarefa para o botao B (gpio 6). Retira um usuario do sistema e mostra "-1 usuario!" no display.
+ * A escrita no display eh protegida pelo mutex. Utiliza o semaforo contador para registrar a interrupcao.
+ * Como o semaforo eh compartilhado com a tarefa de entrada (botao A), ele verifica se realmente foi o
+ * botao B o ultimo pressionado (Give() feito pelo botao B), e se o numero de usuarios eh maior que 0.
+ * Se sim, prossegue com a remocao do usuario. Senao, devolve o semaforo.
+ */
 void vTaskEntrada()
 {
     while (true)
     {
+        // Verifica semaforo contador liberado
         if (xSemaphoreTake(xCounterSem, portMAX_DELAY) == pdTRUE)
         {
+            /* Verifica se realmente foi o botao A quem liberou o semaforo. E se ha usuarios que podem ser
+               adicionados (numero de usuarios menor que 10) */
             if (ultimoBotaoPressionado == BUTTON_A && numeroDeUsuarios < 10)
             {
+                // Verifica mutex liberado para escrita no display
                 if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE)
                 {
                     ssd1306_draw_string(&ssd, "Novo usuario!", 5, 5);
@@ -141,6 +165,21 @@ void vTaskEntrada()
     }
 }
 
+// Funcao para tocar o buzzer, criada para desacoplamento da funcao vTaskBuzzer, tarefa que usa essa funcao
+void tocarBuzzer(uint slice, uint chan, uint wrap, float freq)
+{
+    // Toca o buzzer com uma frequencia, espera e desliga
+    pwm_set_clkdiv(slice, freq);
+    pwm_set_chan_level(slice, chan, wrap / 2);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    pwm_set_chan_level(slice, chan, 0);
+}
+
+/*
+ * Tarefa para tocar o buzzer, emite um sinal sonoro sempre que um botao eh pressionado. O sinal muda a
+ * depender da quantidade de usuarios no sistema. Tambem emite um som de alerta para caso o sistema esteja
+ * cheio e tenha uma tentativa de acrescentar um novo usuario.
+ */
 void vTaskBuzzer()
 {
     uint slice = pwm_gpio_to_slice_num(BUZZER_PIN);
@@ -151,8 +190,35 @@ void vTaskBuzzer()
 
     while (true)
     {
-        if (limiteAtingido)
+        // Sinal para alertar que um novo usuario entrou sem problemas no sistema
+        if (botaoPressionado && (0 <= numeroDeUsuarios && numeroDeUsuarios < 8))
         {
+            tocarBuzzer(slice, chan, 125000000 / 3500, 2.0f);
+            wrap = 0;
+            vTaskDelay(pdMS_TO_TICKS(1250));
+            botaoPressionado = false;
+        }
+        /* Sinal para alertar que um novo usuario entrou sem problemas no sistema, mas esta mais proximo
+           de encher (LED verde aceso)*/
+        else if (botaoPressionado && numeroDeUsuarios == 8)
+        {
+            tocarBuzzer(slice, chan, 125000000 / 3500, 4.0f);
+            wrap = 0;
+            vTaskDelay(pdMS_TO_TICKS(1250));
+            botaoPressionado = false;
+        }
+        // Sinal para alertar que o sistema comporta apenas mais um usuario
+        else if (botaoPressionado && numeroDeUsuarios == 9)
+        {
+            tocarBuzzer(slice, chan, 125000000 / 3500, 8.0f);
+            wrap = 0;
+            vTaskDelay(pdMS_TO_TICKS(1250));
+            botaoPressionado = false;
+        }
+        // Sinal para caso o sistema esteja cheio e haja a tentativa de um novo acrescimo dos usuarios
+        if (botaoPressionado && numeroDeUsuarios == 10)
+        {
+            pwm_set_clkdiv(slice, 10.0f);
             pwm_set_chan_level(slice, chan, 0);
             wrap = 125000000 / 2500;
             pwm_set_chan_level(slice, chan, wrap / 2);
@@ -162,10 +228,9 @@ void vTaskBuzzer()
             pwm_set_chan_level(slice, chan, wrap / 2);
             vTaskDelay(pdMS_TO_TICKS(100));
             pwm_set_chan_level(slice, chan, 0);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(1250));
             wrap = 0;
 
-            limiteAtingido = false;
             botaoPressionado = false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -189,6 +254,10 @@ void desenho_pio(double *desenho, PIO pio, uint sm, float r, float g, float b)
     }
 }
 
+/*
+ * Tarefa para a matriz de LEDs. Exibe um padrao de reinicio caso o botao do joystick (gpio 22) seja
+ * pressionado. Tambem emite um alerta caso o sistema esteja com 9 ou 10 usuarios.
+ */
 void vTaskMatriz()
 {
     PIO pio = pio0;
@@ -196,48 +265,26 @@ void vTaskMatriz()
     uint sm = pio_claim_unused_sm(pio, true);
     blink_program_init(pio, sm, offset, WS2812_PIN);
 
-    double *feedback[4] = {novoUsuario, alerta, erro, matrizDesligada};
+    // Vetor para numero de usuarios == 9 ou numero de usuarios == 10
+    double *feedback[3] = {alerta, erro, matrizDesligada};
 
-    // Vetor com os numeros que serao exibidos na matriz. Todos eles estao desenhados em lib/numeros.c
+    // Vetor para fazer a animacao de reinicio do sistema. Todos eles estao desenhados em lib/numeros.c
     double *animacaoReinicio[15] = {reinicio1, reinicio2, reinicio3, reinicio4, reinicio5, reinicio6,
                                     reinicio7, reinicio8, reinicio9, reinicio10, reinicio11, reinicio12,
                                     reinicio13, reinicio14, matrizDesligada};
 
     while (true)
     {
+        // Animacao de reinicio, botao do joystick pressionado
         if (ultimoBotaoPressionado == BUTTON_JOY && botaoPressionado)
         {
-            desenho_pio(animacaoReinicio[0], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[1], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[2], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[3], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[4], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[5], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[6], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[7], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[8], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[9], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[10], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[11], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[12], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[13], pio, sm, 0.0, 1.0, 0.0);
-            vTaskDelay(pdMS_TO_TICKS(84));
-            desenho_pio(animacaoReinicio[14], pio, sm, 0.0, 1.0, 0.0);
+            for (int i = 0; i < 15; i++)
+            {
+                desenho_pio(animacaoReinicio[i], pio, sm, 0.0, 1.0, 0.0);
+                vTaskDelay(pdMS_TO_TICKS(84));
+            }
         }
-        else if (ultimoBotaoPressionado == BUTTON_A  && botaoPressionado)
+        else if (ultimoBotaoPressionado == BUTTON_A && botaoPressionado)
         {
             if (numeroDeUsuarios == 8)
             {
@@ -257,29 +304,37 @@ void vTaskMatriz()
     }
 }
 
-/* Tarefa para alternar entre os LEDs RGB com PWM */
+/*
+ * Tarefa para alternar entre os LEDs RGB com PWM. Varia junto com o numero de usuarios. Ate 8 usuarios
+ * o LED azul esta aceso. Com 8 usuarios, e LED azul apaga e o LED verde acende. Com 9, exibe a cor amarela.
+ * Com 10, exibe o vermelho.
+ */
 void vTaskRGB()
 {
     while (true)
     {
+        // LED azul aceso
         if (0 <= numeroDeUsuarios && numeroDeUsuarios < 8)
         {
             pwm_set_gpio_level(LED_PIN_GREEN, 0);
             pwm_set_gpio_level(LED_PIN_RED, 0);
             pwm_set_gpio_level(LED_PIN_BLUE, 255);
         }
+        // LED verde aceso
         else if (numeroDeUsuarios == 8)
         {
             pwm_set_gpio_level(LED_PIN_RED, 0);
             pwm_set_gpio_level(LED_PIN_BLUE, 0);
             pwm_set_gpio_level(LED_PIN_GREEN, 255);
         }
+        // LED amarelo aceso (verde e vermelho)
         else if (numeroDeUsuarios == 9)
         {
             pwm_set_gpio_level(LED_PIN_BLUE, 0);
             pwm_set_gpio_level(LED_PIN_GREEN, 255);
             pwm_set_gpio_level(LED_PIN_RED, 255);
         }
+        // LED vermelho aceso
         else if (numeroDeUsuarios == 10)
         {
             pwm_set_gpio_level(LED_PIN_BLUE, 0);
@@ -290,6 +345,11 @@ void vTaskRGB()
     }
 }
 
+/*
+ * Funcao usada pelo vTaskDisplay para desenhar um usuario. Desenha um usuario no display OLED, como o
+ * desenho dos usuarios apresentam um padrao, a funcao requere apenas as coordenadas X e Y para fazer o
+ * desenho.
+ */
 void desenharUsuario(int xStart, int yStart, bool cor)
 {
     int xEnd = xStart + 10;
@@ -309,6 +369,11 @@ void desenharUsuario(int xStart, int yStart, bool cor)
     ssd1306_line(&ssd, xStart + 3, yStart - 12, xEnd - 3, yStart - 12, cor);
 }
 
+/*
+ * Tarefa para desenhos no display OLED. Primeiramente verifica se um botao foi pressionado, se sim,
+ * aguarda pelo mutex para fazer a atualizacao do numero de usuarios que aparecem no display. Se nenhum
+ * botao foi pressionado nos ultimos 1.25 segundps, exibe "Usuarios: x" na tela.
+ */
 void vTaskDisplay()
 {
     // Configuracao do I2C para o display
@@ -328,8 +393,10 @@ void vTaskDisplay()
     bool cor = true;
     while (true)
     {
+        // Verifica se o botao foi pressionado
         if (!botaoPressionado)
         {
+            // Verifica se o mutex esta liberado
             if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE)
             {
                 ssd1306_fill(&ssd, !cor);
@@ -337,6 +404,7 @@ void vTaskDisplay()
                 sprintf(buffer, "Usuarios: %d", numeroDeUsuarios);
                 ssd1306_draw_string(&ssd, buffer, 5, 5);
 
+                // Desenha usuarios com base na quantidade
                 switch (numeroDeUsuarios)
                 {
                 case 10:
@@ -369,6 +437,7 @@ void vTaskDisplay()
     }
 }
 
+// Funcao de callback para o botao de reset (botao do joystick)
 void gpio_callback_reset(uint gpio, uint32_t events)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -376,6 +445,7 @@ void gpio_callback_reset(uint gpio, uint32_t events)
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+// Funcao de callback para o botao A e botao B
 void gpio_callback(uint gpio, uint32_t events)
 {
     ultimoBotaoPressionado = gpio;
@@ -384,29 +454,30 @@ void gpio_callback(uint gpio, uint32_t events)
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+// Interrupcao para os tres botoes com debounce
 void gpio_irq_handler(uint gpio, uint32_t events)
 {
+    // Se outro botao ja foi pressionado, retorna
     if (botaoPressionado)
         return;
 
+    // Debounce de 1.25 segundos
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_irq_time_joy < DEBOUNCE_MS)
+    if (now - lastIrqTime < DEBOUNCE_MS)
         return;
-    last_irq_time_joy = now;
+    lastIrqTime = now;
 
     if (gpio == BUTTON_A)
     {
         botaoPressionado = true;
 
+        // Verifica se o limite ja foi atingido
         if (numeroDeUsuarios == 10)
         {
-            // chegamos ao limite: só tocamos o buzzer
             limiteAtingido = true;
-            // **não** chamar gpio_callback nem dar mais um give no xCounterSem
         }
         else
         {
-            // caso normal: libera o counting semaphore para vTaskEntrada
             ultimoBotaoPressionado = BUTTON_A;
             gpio_callback(gpio, events);
         }
@@ -429,6 +500,7 @@ int main()
 {
     stdio_init_all();
 
+    // Inicializacao dos LEDs
     gpio_init(LED_PIN_GREEN);
     gpio_set_dir(LED_PIN_GREEN, GPIO_OUT);
     gpio_init(LED_PIN_BLUE);
@@ -436,7 +508,7 @@ int main()
     gpio_init(LED_PIN_RED);
     gpio_set_dir(LED_PIN_RED, GPIO_OUT);
 
-    // Inicializando o PWM para o LED verde, LED vermelho e para o buzzer.
+    // Inicializando o PWM para o LED verde, vermelho, azul e para o buzzer
     gpio_set_function(LED_PIN_GREEN, GPIO_FUNC_PWM);
     gpio_set_function(LED_PIN_BLUE, GPIO_FUNC_PWM);
     gpio_set_function(LED_PIN_RED, GPIO_FUNC_PWM);
@@ -457,6 +529,7 @@ int main()
     pwm_set_enabled(slice_led_red, true);
     pwm_set_enabled(slice_buzzer, true);
 
+    // Inicializacao e pull-up dos botoes (A, B e joystick)
     gpio_init(BUTTON_A);
     gpio_set_dir(BUTTON_A, GPIO_IN);
     gpio_pull_up(BUTTON_A);
@@ -467,12 +540,15 @@ int main()
     gpio_set_dir(BUTTON_JOY, GPIO_IN);
     gpio_pull_up(BUTTON_JOY);
 
+    // Contagem do semaforo contador, ate 10 usuarios
     int MAX = 10;
 
+    // Criacao do mutex, semaforo binario e semaforo contador (ate 10 usuarios)
     xMutex = xSemaphoreCreateMutex();
     xBinarySem = xSemaphoreCreateBinary();
     xCounterSem = xSemaphoreCreateCounting(MAX, 0);
 
+    // Interrupcao para os botoes
     gpio_set_irq_enabled_with_callback(BUTTON_A, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
     gpio_set_irq_enabled_with_callback(BUTTON_B, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
     gpio_set_irq_enabled_with_callback(BUTTON_JOY, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
@@ -480,17 +556,17 @@ int main()
     // Criacao das tarefas
     xTaskCreate(vTaskEntrada, "Tarefa para entrada do usuario", configMINIMAL_STACK_SIZE,
                 NULL, tskIDLE_PRIORITY, NULL);
-    xTaskCreate(vTaskSaida, "Tarefa para entrada do usuario", configMINIMAL_STACK_SIZE,
+    xTaskCreate(vTaskSaida, "Tarefa para saida do usuario", configMINIMAL_STACK_SIZE,
                 NULL, tskIDLE_PRIORITY, NULL);
-    xTaskCreate(vTaskReset, "Tarefa para entrada do usuario", configMINIMAL_STACK_SIZE,
+    xTaskCreate(vTaskReset, "Tarefa para reset do sistema", configMINIMAL_STACK_SIZE,
                 NULL, tskIDLE_PRIORITY, NULL);
-    xTaskCreate(vTaskMatriz, "Tarefa para entrada do usuario", configMINIMAL_STACK_SIZE,
+    xTaskCreate(vTaskMatriz, "Tarefa para a matriz de LEDs", configMINIMAL_STACK_SIZE,
                 NULL, tskIDLE_PRIORITY, NULL);
     xTaskCreate(vTaskRGB, "Tarefa dos LEDs", configMINIMAL_STACK_SIZE,
                 NULL, tskIDLE_PRIORITY, NULL);
-    xTaskCreate(vTaskDisplay, "Tarefa dos LEDs", configMINIMAL_STACK_SIZE,
+    xTaskCreate(vTaskDisplay, "Tarefa do display", configMINIMAL_STACK_SIZE,
                 NULL, tskIDLE_PRIORITY, NULL);
-    xTaskCreate(vTaskBuzzer, "Tarefa dos LEDs", configMINIMAL_STACK_SIZE,
+    xTaskCreate(vTaskBuzzer, "Tarefa do buzzer", configMINIMAL_STACK_SIZE,
                 NULL, tskIDLE_PRIORITY, NULL);
 
     vTaskStartScheduler();
